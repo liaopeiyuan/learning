@@ -1,4 +1,3 @@
-# tiny_uno_demo.py
 """Tiny U-NO demo in pure JAX
 =================================
 A *very* small U-shaped Neural Operator that learns the
@@ -9,14 +8,6 @@ following mapping on the unit square
 where **a(x,y)** is a random scalar field.
 The dependence on *average(a)* makes the target non-local,
 so a point-wise CNN cannot nail it, but a Neural Operator can.
-
-Prerequisites
--------------
-pip install jax jaxlib optax --upgrade
-
-How to run
-----------
-python tiny_uno_demo.py
 """
 
 import time
@@ -179,15 +170,22 @@ def loss_fn(forward, params, batch_a, batch_u):
     return mse(pred, batch_u)
 
 
-@partial(jax.jit, static_argnums=0)
+@partial(jax.jit, static_argnums=(0, 5))
 def update_step(forward, params, opt_state, batch_a, batch_u, optimizer):
-    loss, grads = jax.value_and_grad(loss_fn)(forward, params, batch_a, batch_u)
+    # Define a new loss function for grad calculation that closes over 'forward'
+    def _loss_for_grad(p, ba, bu):
+        pred = forward(p, ba)
+        return mse(pred, bu)
+
+    loss, grads = jax.value_and_grad(_loss_for_grad)(
+        params, batch_a, batch_u
+    )  # Differentiate w.r.t. params (the first arg of _loss_for_grad)
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
     return params, opt_state, loss
 
 
-def train(key, epochs=400, n=32, train_size=512, batch=8):
+def train(key, epochs=10000, n=32, train_size=512, batch=8):
     # dataset ------------------------------------------------
     key_train, key_test = jax.random.split(key)
     a_train, u_train = make_dataset(key_train, train_size, n)
