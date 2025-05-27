@@ -1,0 +1,15 @@
+[project]
+name = "physics-engine"
+version = "0.1.0"
+description = "learning"
+authors = [
+    {name = "Your Name", email = "you@example.com"},
+]
+dependencies = [
+    "jax",
+    "optax",
+]
+
+
+[tool.uv]
+# Add any uv specific configurations here
