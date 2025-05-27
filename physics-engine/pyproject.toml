@@ -9,6 +9,7 @@ dependencies = [
     "jax",
     "jaxlib",
     "optax",
+    "matplotlib",
 ]
 
 
