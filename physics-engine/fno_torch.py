@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import time
 from typing import Tuple, Dict
+
 import numpy as np
 import torch
 import torch.fft as fft
@@ -10,9 +13,12 @@ import matplotlib.pyplot as plt
 
 Tensor = torch.Tensor
 
+# -----------------------------------------------------------------------------
+#  Device ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
-elif torch.backends.mps.is_available():
+elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cpu")
@@ -27,58 +33,63 @@ def count_params(module: nn.Module) -> int:
 # -----------------------------------------------------------------------------
 #  Fourier layer (2-D, real) = baseline FNO
 # -----------------------------------------------------------------------------
-
-
 class SpectralConv2d(nn.Module):
-    """2-D spectral convolution layer with a *limited* number of Fourier modes.
+    """2-D spectral convolution with a limited number of Fourier modes.
 
-    Implements Eq. (4) of the paper: hat u(k) = R(k) · hat v(k).
-    Only the lowest *modes* are learned, higher frequencies are zeroed out.
+    Implements Eq.(4) of the FNO paper for **real-valued** inputs.
+    The first `modes` x `modes` Fourier coefficients are learned; others are
+    left untouched (i.e. multiplied by zero).
     """
 
     def __init__(self, in_channels: int, out_channels: int, modes: int):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.modes = modes  # number of Fourier modes along each dimension
+        self.modes = modes  # learn up to this many spectral modes per dim
 
-        # Complex weights for learned modes = initialise with normal distribution
+        # Complex weights for the learned modes
         scale = 1 / (in_channels * out_channels)
         self.weight = nn.Parameter(
             torch.randn(in_channels, out_channels, modes, modes, dtype=torch.cfloat)
             * scale
         )
 
-    def compl_mul2d(self, input: Tensor, weight: Tensor) -> Tensor:
-        # (b, c_in, h, w), weight (c_in, c_out, m, m)
-        b, c_in, h, w = input.shape
-        m = self.modes
-        out_ft = torch.zeros(
-            b, self.out_channels, h, w // 2 + 1, dtype=torch.cfloat, device=input.device
-        )
+    def compl_mul2d(self, x_ft: Tensor) -> Tensor:
+        """Multiply in Fourier domain (batched complex matmul).
 
-        # top-left corner              (k_x < m, k_y < m)
+        x_ft: (batch, C_in, H, W_half+1)
+        returns (batch, C_out, H, W_half+1)
+        """
+        b, c_in, h, w_half = x_ft.shape
+        m = min(self.modes, h, w_half)  # clip to grid Nyquist
+
+        weight = self.weight[:, :, :m, :m]  # (C_in, C_out, m, m)
+
+        # allocate output & perform batched matmul on the low-freq block
+        out_ft = torch.zeros(
+            b,
+            self.out_channels,
+            h,
+            w_half,
+            dtype=torch.cfloat,
+            device=x_ft.device,
+        )
         out_ft[:, :, :m, :m] = torch.einsum(
-            "bcih,coih->boih",
-            input[:, :, :m, :m],
-            weight,  # type: ignore[misc]
+            "bcij,coij->boij",
+            x_ft[:, :, :m, :m],
+            weight,
         )
         return out_ft
 
     def forward(self, x: Tensor) -> Tensor:
-        b, c, h, w = x.shape
-        # Fourier transform
-        x_ft = fft.rfft2(x, norm="ortho")
-        # Apply learned complex weights on low-frequency modes
-        out_ft = self.compl_mul2d(x_ft, self.weight)
-        # Inverse FFT to spatial domain
-        x = fft.irfft2(out_ft, s=(h, w), norm="ortho")
+        # x: (B, C, H, W) real
+        x_ft = fft.rfft2(x, norm="ortho")  # (B, C, H, W//2+1)
+        out_ft = self.compl_mul2d(x_ft)
+        x = fft.irfft2(out_ft, s=x.shape[-2:], norm="ortho")  # back to real
         return x
 
 
 class FNO2d(nn.Module):
-    """Baseline 2-D FNO = stack of spectral conv + pointwise linear layers."""
-
     def __init__(
         self,
         in_channels: int = 1,
@@ -88,70 +99,58 @@ class FNO2d(nn.Module):
         modes: int = 12,
     ):
         super().__init__()
-
         self.lift = nn.Conv2d(in_channels, width, 1)
         self.proj = nn.Conv2d(width, out_channels, 1)
 
-        self.spectral_layers = nn.ModuleList()
-        self.w_local = nn.ModuleList()
-        for _ in range(depth):
-            self.spectral_layers.append(SpectralConv2d(width, width, modes))
-            self.w_local.append(nn.Conv2d(width, width, 1))
-        self.depth = depth
+        self.spectral_layers = nn.ModuleList(
+            [SpectralConv2d(width, width, modes) for _ in range(depth)]
+        )
+        self.w_local = nn.ModuleList([nn.Conv2d(width, width, 1) for _ in range(depth)])
 
     def forward(self, x: Tensor) -> Tensor:
-        # x: (b, c_in, h, w)
         x = self.lift(x)
-        for k in range(self.depth):
-            v = self.spectral_layers[k](x)
-            x = v + self.w_local[k](x)
-            x = F.gelu(x)
-        x = self.proj(x)
-        return x
+        for spec, pw in zip(self.spectral_layers, self.w_local):
+            v = spec(x)
+            x = F.gelu(v + pw(x))
+        return self.proj(x)
 
 
+# -----------------------------------------------------------------------------
+#  Synthetic data - Gaussian random field + toy operator
+# -----------------------------------------------------------------------------
 def make_complex_dataset(
     seed: int, n_samples: int, n: int = 64
 ) -> Tuple[Tensor, Tensor]:
+    """Return (a, u) with shapes:
+    a - (N, 1, n, n)
+    u - (N, 1, n, n)
+    """
     rng = np.random.default_rng(seed)
 
     x = np.linspace(0.0, 1.0, n, endpoint=False)
     xx, yy = np.meshgrid(x, x, indexing="ij")
 
     def generate_grf_2d(alpha: float = 2.0, tau: float = 3.0) -> np.ndarray:
-        """Generate a 2D Gaussian Random Field using spectral method.
-
-        Args:
-            alpha: Smoothness parameter (higher = smoother)
-            tau: Length scale parameter (higher = larger features)
-        """
-        # Create frequency grid
-        k_x = np.fft.fftfreq(n, d=1 / n).reshape(-1, 1)
-        k_y = np.fft.fftfreq(n, d=1 / n).reshape(1, -1)
-        k_norm = np.sqrt(k_x**2 + k_y**2)
-
-        # Avoid division by zero at origin
+        """Spectral-domain GRF with Hermitian symmetry → real field."""
+        kx = np.fft.fftfreq(n, d=1 / n).reshape(-1, 1)
+        ky = np.fft.rfftfreq(n, d=1 / n).reshape(1, -1)
+        k_norm = np.sqrt(kx**2 + ky**2)
         k_norm[0, 0] = 1.0
 
-        # Power spectrum for GRF: P(k) ~ (1 + |k|^2 / tau^2)^(-alpha/2)
-        power_spectrum = (1 + (k_norm**2) / (tau**2)) ** (-alpha / 2)
-        power_spectrum[0, 0] = 0  # Zero mean
+        power = (1 + (k_norm**2) / tau**2) ** (-alpha / 2)
+        power[0, 0] = 0.0  # zero-mean field
 
-        # Generate random Fourier coefficients
-        noise_real = rng.normal(0, 1, (n, n))
-        noise_imag = rng.normal(0, 1, (n, n))
-        noise_fft = noise_real + 1j * noise_imag
+        noise_real = rng.normal(0, 1, (n, n // 2 + 1))
+        noise_imag = rng.normal(0, 1, (n, n // 2 + 1))
+        noise_imag[:, 0] = 0.0  # enforce Hermitian symmetry on borders
+        if n % 2 == 0:
+            noise_imag[n // 2] = 0.0
 
-        # Apply power spectrum
-        grf_fft = noise_fft * np.sqrt(power_spectrum)
-
-        # Inverse FFT to get the field
-        grf = np.real(np.fft.ifft2(grf_fft))
-
-        # Normalize to have unit variance
-        grf = grf / grf.std()
-
-        return grf[..., None]
+        coeffs = (noise_real + 1j * noise_imag) * np.sqrt(power)
+        field = np.fft.irfft2(coeffs, s=(n, n))
+        field -= field.mean()
+        field /= field.std()
+        return field[..., None]
 
     def apply_operator(field: np.ndarray) -> np.ndarray:
         mean_val = field.mean()
@@ -173,17 +172,15 @@ def make_complex_dataset(
     a = np.stack([generate_grf_2d() for _ in range(n_samples)], axis=0)
     u = np.stack([apply_operator(a[i]) for i in range(n_samples)], axis=0)
 
-    # to torch
+    # → torch
     a_t = torch.from_numpy(a.astype(np.float32)).permute(0, 3, 1, 2).to(DEVICE)
     u_t = torch.from_numpy(u.astype(np.float32)).permute(0, 3, 1, 2).to(DEVICE)
     return a_t, u_t
 
 
 # -----------------------------------------------------------------------------
-#  Naive MLP baseline = kept for comparison (now Torch)
+#  Naïve MLP baseline
 # -----------------------------------------------------------------------------
-
-
 class FlattenMLP(nn.Module):
     def __init__(self, input_dim: int, hidden: list[int], output_dim: int):
         super().__init__()
@@ -204,17 +201,15 @@ class FlattenMLP(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-#  Training & evaluation helpers
+#  Helpers
 # -----------------------------------------------------------------------------
-
-
 def train(
     model: nn.Module,
     optimiser: torch.optim.Optimizer,
     a: Tensor,
     u: Tensor,
-    steps: int = 300,
-    batch: int = 8,
+    steps: int,
+    batch: int,
 ):
     model.train()
     n = a.shape[0]
@@ -227,25 +222,23 @@ def train(
         loss.backward()
         optimiser.step()
         if step % 100 == 0:
-            print(f"Step {step:3d} | loss = {loss.item():.4e}")
+            print(f"Step {step:4d} | loss = {loss.item():.4e}")
 
 
+@torch.no_grad()
 def evaluate(model: nn.Module, a_test: Tensor, u_test: Tensor) -> Dict[str, float]:
     model.eval()
-    with torch.no_grad():
-        pred = model(a_test)
-        mse = F.mse_loss(pred, u_test).item()
-        err = torch.abs(pred - u_test)
-        rel = (err / (u_test.abs() + 1e-8)).mean().item()
-        mx = err.max().item()
+    pred = model(a_test)
+    mse = F.mse_loss(pred, u_test).item()
+    err = torch.abs(pred - u_test)
+    rel = (err / (u_test.abs() + 1e-8)).mean().item()
+    mx = err.max().item()
     return {"mse": mse, "relative_error": rel, "max_error": mx}
 
 
 # -----------------------------------------------------------------------------
-#  Visualisation (identical to original, now expects torch tensors)
+#  Visualisation
 # -----------------------------------------------------------------------------
-
-
 def visualize(a_s: Tensor, u_true: Tensor, mlp_pred: Tensor, fno_pred: Tensor):
     a_s_np = a_s.detach().cpu().numpy()
     u_true_np = u_true.detach().cpu().numpy()
@@ -254,39 +247,33 @@ def visualize(a_s: Tensor, u_true: Tensor, mlp_pred: Tensor, fno_pred: Tensor):
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
-    # Top row: Input Field, MLP Prediction, FNO Prediction
-    im0 = axes[0, 0].imshow(a_s_np[0, 0], cmap="viridis")
+    # Top row
+    axes[0, 0].imshow(a_s_np[0, 0], cmap="viridis")
     axes[0, 0].set_title("Input Field")
     axes[0, 0].axis("off")
-    plt.colorbar(im0, ax=axes[0, 0], fraction=0.046)
 
-    im1 = axes[0, 1].imshow(mlp_pred_np[0, 0], cmap="RdBu_r")
+    axes[0, 1].imshow(mlp_pred_np[0, 0], cmap="RdBu_r")
     axes[0, 1].set_title("MLP Prediction")
     axes[0, 1].axis("off")
-    plt.colorbar(im1, ax=axes[0, 1], fraction=0.046)
 
-    im2 = axes[0, 2].imshow(fno_pred_np[0, 0], cmap="RdBu_r")
+    axes[0, 2].imshow(fno_pred_np[0, 0], cmap="RdBu_r")
     axes[0, 2].set_title("FNO Prediction")
     axes[0, 2].axis("off")
-    plt.colorbar(im2, ax=axes[0, 2], fraction=0.046)
 
-    # Bottom row: Ground Truth, MLP Error, FNO Error
-    im3 = axes[1, 0].imshow(u_true_np[0, 0], cmap="RdBu_r")
+    # Bottom row
+    axes[1, 0].imshow(u_true_np[0, 0], cmap="RdBu_r")
     axes[1, 0].set_title("Ground Truth")
     axes[1, 0].axis("off")
-    plt.colorbar(im3, ax=axes[1, 0], fraction=0.046)
 
-    mlp_err = np.abs(mlp_pred_np[0, 0] - u_true_np[0, 0])
-    im4 = axes[1, 1].imshow(mlp_err, cmap="hot")
+    mlp_err = np.abs(mlp_pred_np - u_true_np)[0, 0]
+    axes[1, 1].imshow(mlp_err, cmap="hot")
     axes[1, 1].set_title(f"MLP Error (max={mlp_err.max():.3f})")
     axes[1, 1].axis("off")
-    plt.colorbar(im4, ax=axes[1, 1], fraction=0.046)
 
-    fno_err = np.abs(fno_pred_np[0, 0] - u_true_np[0, 0])
-    im5 = axes[1, 2].imshow(fno_err, cmap="hot")
+    fno_err = np.abs(fno_pred_np - u_true_np)[0, 0]
+    axes[1, 2].imshow(fno_err, cmap="hot")
     axes[1, 2].set_title(f"FNO Error (max={fno_err.max():.3f})")
     axes[1, 2].axis("off")
-    plt.colorbar(im5, ax=axes[1, 2], fraction=0.046)
 
     plt.tight_layout()
     return fig
@@ -295,19 +282,17 @@ def visualize(a_s: Tensor, u_true: Tensor, mlp_pred: Tensor, fno_pred: Tensor):
 # -----------------------------------------------------------------------------
 #  Main comparison
 # -----------------------------------------------------------------------------
-
-
 def main():
     n = 64
-    train_samples = 256
+    train_samples = 25600
     test_samples = 64
-    steps = 1000  # Increased from 300
-    fno_steps = 5000  # Much longer training for FNO
-    batch = 8
+    steps = 1000
+    fno_steps = 5000
+    batch = 32
 
-    print("=" * 70)
-    print("Baseline FNO vs MLP = PyTorch edition")
-    print("=" * 70)
+    print("=" * 72)
+    print("Baseline FNO vs MLP")
+    print("=" * 72)
 
     a_train, u_train = make_complex_dataset(42, train_samples, n)
     a_test, u_test = make_complex_dataset(123, test_samples, n)
@@ -328,7 +313,7 @@ def main():
 
     opt_fno = torch.optim.Adam(fno.parameters(), lr=3e-4)
     t0 = time.time()
-    print(f"\nTraining FNO for {fno_steps} steps...")
+    print(f"Training FNO for {fno_steps} steps...")
     train(fno, opt_fno, a_train, u_train, steps=fno_steps, batch=batch)
     fno_time = time.time() - t0
     fno_res = evaluate(fno, a_test, u_test)
@@ -349,111 +334,71 @@ def main():
         fno_pred = fno(a_test[:1])
 
     fig = visualize(a_test[:1], u_test[:1], mlp_pred, fno_pred)
-    fig.savefig("fno_vs_mlp_predictions.png", dpi=150, bbox_inches="tight")
-    print("Saved figure to 'fno_vs_mlp_predictions.png'")
+    fig.savefig("fno_vs_mlp_predictions_fixed.png", dpi=150, bbox_inches="tight")
+    print("Saved figure to 'fno_vs_mlp_predictions_fixed.png'")
 
-    # Return the trained FNO model for use in multi-scale test
     return fno
 
 
-def test_fno_multiscale(fno):
-    """Test FNO's ability to handle different scales/resolutions."""
-    print("\n" + "=" * 70)
-    print("Testing FNO Multi-scale Capabilities")
-    print("=" * 70)
+# -----------------------------------------------------------------------------
+#  Multi-scale test - no more down/upsampling
+# -----------------------------------------------------------------------------
+@torch.no_grad()
+def test_fno_multiscale(fno: nn.Module):
+    print("\n" + "=" * 72)
+    print("Testing FNO Multi-scale Capabilities (native grids)")
+    print("=" * 72)
 
-    # The FNO model is already trained from main()
-    n_train = 64
-    print(f"Using FNO trained on {n_train}x{n_train} resolution...")
-
-    # Test on multiple resolutions
     test_resolutions = [32, 64, 128]
     results = {}
 
     fig, axes = plt.subplots(4, len(test_resolutions), figsize=(15, 16))
 
     for i, n_test in enumerate(test_resolutions):
-        print(f"\nTesting on {n_test}x{n_test} resolution...")
+        print(f"\nTesting on {n_test}x{n_test} grid ...")
+        a_test, u_test = make_complex_dataset(999 + n_test, 16, n_test)
 
-        # Generate test data at different resolution
-        a_test, u_test = make_complex_dataset(123, 16, n_test)
+        pred = fno(a_test)
 
-        # For resolutions different from training, we need to interpolate
-        if n_test != n_train:
-            # Interpolate input to training resolution
-            a_interp = F.interpolate(
-                a_test, size=(n_train, n_train), mode="bilinear", align_corners=False
-            )
-
-            # Get prediction at training resolution
-            with torch.no_grad():
-                pred_train_res = fno(a_interp)
-
-            # Interpolate prediction back to test resolution
-            pred = F.interpolate(
-                pred_train_res,
-                size=(n_test, n_test),
-                mode="bilinear",
-                align_corners=False,
-            )
-        else:
-            with torch.no_grad():
-                pred = fno(a_test)
-
-        # Evaluate
-        res = (
-            evaluate(fno, a_test, u_test)
-            if n_test == n_train
-            else {
-                "mse": F.mse_loss(pred, u_test).item(),
-                "relative_error": (torch.abs(pred - u_test) / (u_test.abs() + 1e-8))
-                .mean()
-                .item(),
-                "max_error": torch.abs(pred - u_test).max().item(),
-            }
-        )
+        # Metrics
+        res = evaluate(fno, a_test, u_test)
         results[n_test] = res
 
-        # Visualize first sample
+        # Visualise first sample
         a_np = a_test[0, 0].cpu().numpy()
         u_np = u_test[0, 0].cpu().numpy()
-        pred_np = pred[0, 0].detach().cpu().numpy()
-        error_np = np.abs(pred_np - u_np)
+        pred_np = pred[0, 0].cpu().numpy()
+        err_np = np.abs(pred_np - u_np)
 
-        # Input
-        im0 = axes[0, i].imshow(a_np, cmap="viridis")
-        axes[0, i].set_title(f"Input ({n_test}x{n_test})")
-        axes[0, i].axis("off")
-        plt.colorbar(im0, ax=axes[0, i], fraction=0.046)
-
-        # Ground Truth
-        im1 = axes[1, i].imshow(u_np, cmap="RdBu_r")
-        axes[1, i].set_title("Ground Truth")
-        axes[1, i].axis("off")
-        plt.colorbar(im1, ax=axes[1, i], fraction=0.046)
-
-        # Prediction
-        im2 = axes[2, i].imshow(pred_np, cmap="RdBu_r")
-        axes[2, i].set_title("FNO Prediction")
-        axes[2, i].axis("off")
-        plt.colorbar(im2, ax=axes[2, i], fraction=0.046)
-
-        # Error
-        im3 = axes[3, i].imshow(error_np, cmap="hot")
-        axes[3, i].set_title(f"Error (max={error_np.max():.3f})")
-        axes[3, i].axis("off")
-        plt.colorbar(im3, ax=axes[3, i], fraction=0.046)
+        for row, img, title in zip(
+            range(4),
+            [a_np, u_np, pred_np, err_np],
+            [
+                f"Input ({n_test}x{n_test})",
+                "Ground Truth",
+                "FNO Prediction",
+                f"Error (max={err_np.max():.3f})",
+            ],
+        ):
+            axes[row, i].imshow(
+                img,
+                cmap="viridis" if row == 0 else "RdBu_r" if row in [1, 2] else "hot",
+            )
+            axes[row, i].set_title(title)
+            axes[row, i].axis("off")
 
     plt.tight_layout()
-    plt.savefig("fno_multiscale_test.png", dpi=150, bbox_inches="tight")
-    print("\nSaved multi-scale test figure to 'fno_multiscale_test.png'")
+    plt.savefig("fno_multiscale_test_fixed.png", dpi=150, bbox_inches="tight")
+    print("\nSaved multi-scale figure to 'fno_multiscale_test_fixed.png'")
 
-    # Print results summary
+    # Results table
     print("\nMulti-scale Results Summary:")
     print("-" * 50)
     for res_size, metrics in results.items():
         print(
-            f"{res_size}x{res_size}: MSE={metrics['mse']:.4e}, RelErr={metrics['relative_error']:.2%}, MaxErr={metrics['max_error']:.3f}"
+            f"{res_size}²: MSE={metrics['mse']:.4e}, "
+            f"RelErr={metrics['relative_error']:.2%}, "
+            f"MaxErr={metrics['max_error']:.3f}"
         )
 
 
