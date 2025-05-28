@@ -1,16 +1,3 @@
-# Fourier Neural Operator (baseline) with PyTorch
-# =================================================
-# This script is a simplified rewrite of the original JAX U-NO showcase. It illustrates the *baseline*
-# Fourier Neural Operator (FNO) described by Li et al., *ICLR 2021* = see Figure 2(b) and Eq. (4) in the
-# paper. The two requested changes are fulfilled:
-#   1.  **Switched the framework from JAX to PyTorch**
-#   2.  **Replaced the U-NO architecture with the plain FNO (no U-Net skip-connections)**
-#
-# The rest of the script (dataset generation, naive MLP baseline, training loop, visualisation) is kept
-# very close to the original so comparisons remain meaningful.
-# ------------------------------------------------------------
-
-from __future__ import annotations
 import time
 from typing import Tuple, Dict
 import numpy as np
@@ -20,12 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-# -----------------------------------------------------------------------------
-# Helper aliases & utilities
-# -----------------------------------------------------------------------------
+
 Tensor = torch.Tensor
 
-# Check for available device (CUDA, MPS, or CPU)
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 elif torch.backends.mps.is_available():
@@ -126,11 +110,6 @@ class FNO2d(nn.Module):
         return x
 
 
-# -----------------------------------------------------------------------------
-#  Complex synthetic dataset (unchanged, now outputs torch tensors)
-# -----------------------------------------------------------------------------
-
-
 def make_complex_dataset(
     seed: int, n_samples: int, n: int = 64
 ) -> Tuple[Tensor, Tensor]:
@@ -139,13 +118,40 @@ def make_complex_dataset(
     x = np.linspace(0.0, 1.0, n, endpoint=False)
     xx, yy = np.meshgrid(x, x, indexing="ij")
 
-    def generate_structured_input() -> np.ndarray:
-        low_freq = rng.normal(size=(8, 8, 1))
-        low_freq = np.stack(
-            [np.kron(low_freq[:, :, 0], np.ones((n // 8, n // 8)))], axis=-1
-        )  # crude resize without scipy
-        high_freq = 0.3 * rng.normal(size=(n, n, 1))
-        return low_freq + high_freq
+    def generate_grf_2d(alpha: float = 2.0, tau: float = 3.0) -> np.ndarray:
+        """Generate a 2D Gaussian Random Field using spectral method.
+
+        Args:
+            alpha: Smoothness parameter (higher = smoother)
+            tau: Length scale parameter (higher = larger features)
+        """
+        # Create frequency grid
+        k_x = np.fft.fftfreq(n, d=1 / n).reshape(-1, 1)
+        k_y = np.fft.fftfreq(n, d=1 / n).reshape(1, -1)
+        k_norm = np.sqrt(k_x**2 + k_y**2)
+
+        # Avoid division by zero at origin
+        k_norm[0, 0] = 1.0
+
+        # Power spectrum for GRF: P(k) ~ (1 + |k|^2 / tau^2)^(-alpha/2)
+        power_spectrum = (1 + (k_norm**2) / (tau**2)) ** (-alpha / 2)
+        power_spectrum[0, 0] = 0  # Zero mean
+
+        # Generate random Fourier coefficients
+        noise_real = rng.normal(0, 1, (n, n))
+        noise_imag = rng.normal(0, 1, (n, n))
+        noise_fft = noise_real + 1j * noise_imag
+
+        # Apply power spectrum
+        grf_fft = noise_fft * np.sqrt(power_spectrum)
+
+        # Inverse FFT to get the field
+        grf = np.real(np.fft.ifft2(grf_fft))
+
+        # Normalize to have unit variance
+        grf = grf / grf.std()
+
+        return grf[..., None]
 
     def apply_operator(field: np.ndarray) -> np.ndarray:
         mean_val = field.mean()
@@ -164,7 +170,7 @@ def make_complex_dataset(
         )
         return u[..., None]
 
-    a = np.stack([generate_structured_input() for _ in range(n_samples)], axis=0)
+    a = np.stack([generate_grf_2d() for _ in range(n_samples)], axis=0)
     u = np.stack([apply_operator(a[i]) for i in range(n_samples)], axis=0)
 
     # to torch
@@ -248,23 +254,25 @@ def visualize(a_s: Tensor, u_true: Tensor, mlp_pred: Tensor, fno_pred: Tensor):
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
+    # Top row: Input Field, MLP Prediction, FNO Prediction
     im0 = axes[0, 0].imshow(a_s_np[0, 0], cmap="viridis")
     axes[0, 0].set_title("Input Field")
     axes[0, 0].axis("off")
     plt.colorbar(im0, ax=axes[0, 0], fraction=0.046)
 
-    im1 = axes[0, 1].imshow(u_true_np[0, 0], cmap="RdBu_r")
-    axes[0, 1].set_title("Ground Truth")
+    im1 = axes[0, 1].imshow(mlp_pred_np[0, 0], cmap="RdBu_r")
+    axes[0, 1].set_title("MLP Prediction")
     axes[0, 1].axis("off")
     plt.colorbar(im1, ax=axes[0, 1], fraction=0.046)
 
-    im2 = axes[0, 2].imshow(mlp_pred_np[0, 0], cmap="RdBu_r")
-    axes[0, 2].set_title("MLP Prediction")
+    im2 = axes[0, 2].imshow(fno_pred_np[0, 0], cmap="RdBu_r")
+    axes[0, 2].set_title("FNO Prediction")
     axes[0, 2].axis("off")
     plt.colorbar(im2, ax=axes[0, 2], fraction=0.046)
 
-    im3 = axes[1, 0].imshow(fno_pred_np[0, 0], cmap="RdBu_r")
-    axes[1, 0].set_title("FNO Prediction")
+    # Bottom row: Ground Truth, MLP Error, FNO Error
+    im3 = axes[1, 0].imshow(u_true_np[0, 0], cmap="RdBu_r")
+    axes[1, 0].set_title("Ground Truth")
     axes[1, 0].axis("off")
     plt.colorbar(im3, ax=axes[1, 0], fraction=0.046)
 
@@ -294,6 +302,7 @@ def main():
     train_samples = 256
     test_samples = 64
     steps = 1000  # Increased from 300
+    fno_steps = 5000  # Much longer training for FNO
     batch = 8
 
     print("=" * 70)
@@ -304,8 +313,7 @@ def main():
     a_test, u_test = make_complex_dataset(123, test_samples, n)
 
     # ---------------- MLP baseline ----------------
-    # Reduced MLP size to match FNO parameter count (~1M params)
-    mlp = FlattenMLP(n * n, [256, 512, 256], n * n).to(DEVICE)
+    mlp = FlattenMLP(n * n, [256, 256, 256], n * n).to(DEVICE)
     print(f"MLP parameters: {count_params(mlp):,}")
 
     opt_mlp = torch.optim.Adam(mlp.parameters(), lr=1e-3)
@@ -320,7 +328,8 @@ def main():
 
     opt_fno = torch.optim.Adam(fno.parameters(), lr=3e-4)
     t0 = time.time()
-    train(fno, opt_fno, a_train, u_train, steps=steps, batch=batch)
+    print(f"\nTraining FNO for {fno_steps} steps...")
+    train(fno, opt_fno, a_train, u_train, steps=fno_steps, batch=batch)
     fno_time = time.time() - t0
     fno_res = evaluate(fno, a_test, u_test)
 
@@ -343,25 +352,19 @@ def main():
     fig.savefig("fno_vs_mlp_predictions.png", dpi=150, bbox_inches="tight")
     print("Saved figure to 'fno_vs_mlp_predictions.png'")
 
+    # Return the trained FNO model for use in multi-scale test
+    return fno
 
-def test_fno_multiscale():
+
+def test_fno_multiscale(fno):
     """Test FNO's ability to handle different scales/resolutions."""
     print("\n" + "=" * 70)
     print("Testing FNO Multi-scale Capabilities")
     print("=" * 70)
 
-    # Train on one resolution
+    # The FNO model is already trained from main()
     n_train = 64
-    n_samples = 256
-    a_train, u_train = make_complex_dataset(42, n_samples, n_train)
-
-    # Create FNO model
-    fno = FNO2d(in_channels=1, out_channels=1, width=32, depth=4, modes=16).to(DEVICE)
-    print(f"Training FNO on {n_train}x{n_train} resolution...")
-
-    # Train
-    optimizer = torch.optim.Adam(fno.parameters(), lr=3e-4)
-    train(fno, optimizer, a_train, u_train, steps=500, batch=8)
+    print(f"Using FNO trained on {n_train}x{n_train} resolution...")
 
     # Test on multiple resolutions
     test_resolutions = [32, 64, 128]
@@ -425,13 +428,13 @@ def test_fno_multiscale():
 
         # Ground Truth
         im1 = axes[1, i].imshow(u_np, cmap="RdBu_r")
-        axes[1, i].set_title(f"Ground Truth")
+        axes[1, i].set_title("Ground Truth")
         axes[1, i].axis("off")
         plt.colorbar(im1, ax=axes[1, i], fraction=0.046)
 
         # Prediction
         im2 = axes[2, i].imshow(pred_np, cmap="RdBu_r")
-        axes[2, i].set_title(f"FNO Prediction")
+        axes[2, i].set_title("FNO Prediction")
         axes[2, i].axis("off")
         plt.colorbar(im2, ax=axes[2, i], fraction=0.046)
 
@@ -455,5 +458,5 @@ def test_fno_multiscale():
 
 
 if __name__ == "__main__":
-    main()
-    test_fno_multiscale()
+    fno_model = main()
+    test_fno_multiscale(fno_model)
